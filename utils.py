@@ -34,14 +34,26 @@ LAYER_CONFIG = {
 LAYER_NUM_ANCHORS = {name: len(cfg["ratios"]) + 1 for name, cfg in LAYER_CONFIG.items()}
 
 
-def generate_anchors(layer_shapes):
+def generate_anchors(layer_shapes, custom_wh=None):
     """
     يولّد صناديق الإرساء لمجموعة من طبقات الـ feature maps.
     layer_shapes: قائمة من (اسم_الطبقة, ارتفاع, عرض) بحسب الطبقات المفعّلة فعلياً.
+    custom_wh: قاموس اختياري {اسم_الطبقة: [(w,h), ...]} من compute_layer_anchor_wh()
+        (K-Means على بيانات حقيقية - القسم 3.7). إن وُجد، يُستخدم بدل الصيغة
+        الثابتة القائمة على scale/ratios لتلك الطبقة تحديداً.
     الإخراج: Tensor بشكل (N, 4) بصيغة (cx, cy, w, h) مُطبَّعة بين 0 و1.
     """
     anchors = []
     for name, h, w in layer_shapes:
+        if custom_wh and name in custom_wh:
+            for i in range(h):
+                cy = (i + 0.5) / h
+                for j in range(w):
+                    cx = (j + 0.5) / w
+                    for box_w, box_h in custom_wh[name]:
+                        anchors.append((cx, cy, box_w, box_h))
+            continue
+
         cfg = LAYER_CONFIG[name]
         sk = cfg["scale"]
         sk_next = cfg["next_scale"]
@@ -187,6 +199,43 @@ def kmeans_anchor_boxes(boxes_wh, k, iters=100, seed=42):
                 clusters[cluster_idx] = members.mean(axis=0)
 
     return clusters
+
+
+def compute_layer_anchor_wh(dataset):
+    """
+    يحسب أبعاد (w, h) مثلى للـ Anchors بأسلوب K-Means من التوزيع الحقيقي
+    لصناديق مجموعة بيانات فعلية (القسم 3.7)، ويوزّعها على الطبقات القانونية
+    c1..c4 حسب المساحة تصاعدياً: الأصغر لأدق طبقة (c1) تناسباً مع كشف
+    الأجسام الصغيرة، والأكبر لأخشن طبقة (c4) لكشف الأجسام الكبيرة.
+
+    dataset: أي كائن يدعم len() و[]، ويُرجع (frame, boxes, labels) حيث boxes
+        بصيغة corner مُطبَّعة [0,1] (مثل train.VOCDataset).
+    يُعاد: قاموس {"c1": [(w,h),...], "c2": [...], "c3": [...], "c4": [...]}
+        جاهز للتمرير مباشرة إلى generate_anchors(custom_wh=...).
+    """
+    all_wh = []
+    for i in range(len(dataset)):
+        _, boxes, _ = dataset[i]
+        if boxes.numel() == 0:
+            continue
+        wh = (boxes[:, 2:] - boxes[:, :2]).numpy()
+        all_wh.append(wh)
+    all_wh = np.concatenate(all_wh, axis=0)
+
+    layer_order = ("c1", "c2", "c3", "c4")
+    total_k = sum(LAYER_NUM_ANCHORS[name] for name in layer_order)
+    clusters = kmeans_anchor_boxes(all_wh, k=total_k)
+
+    areas = clusters[:, 0] * clusters[:, 1]
+    clusters = clusters[areas.argsort()]
+
+    result, idx = {}, 0
+    for name in layer_order:
+        k = LAYER_NUM_ANCHORS[name]
+        result[name] = [tuple(pair) for pair in clusters[idx:idx + k].tolist()]
+        idx += k
+
+    return result
 
 
 VOC_CLASSES = (

@@ -12,9 +12,18 @@ MODE_CONFIG = {
 
 
 class AdaptiveSSD(nn.Module):
-    def __init__(self, num_classes, pretrained_backbone=True):
+    def __init__(self, num_classes, pretrained_backbone=True, anchor_wh=None):
+        """
+        anchor_wh: قاموس اختياري {"c1": [(w,h),...], ...} من
+            utils.compute_layer_anchor_wh() (K-Means على بيانات حقيقية -
+            القسم 3.7). إن تُرك None تُستخدم الصيغة الثابتة الافتراضية.
+            يجب أن يُحفظ ويُحمَّل دائماً مع أوزان النموذج المدرَّبة عليه،
+            لأن رؤوس التوقع (loc_heads) تتعلم إزاحات نسبية لهذه الأبعاد
+            تحديداً - تغييرها بعد التدريب يُبطل معنى تلك الإزاحات.
+        """
         super(AdaptiveSSD, self).__init__()
         self.num_classes = num_classes
+        self.anchor_wh = anchor_wh
 
         # 1. استدعاء الـ Backbone (يعيد قائمة (اسم_الطبقة, feature_map) حسب الوضع)
         self.backbone = MobileNetV3Backbone(pretrained=pretrained_backbone)
@@ -59,7 +68,7 @@ class AdaptiveSSD(nn.Module):
         """يولّد anchors مرة واحدة فقط لكل تركيبة (وضع + أبعاد) ثم يخزّنها مؤقتاً."""
         cache_key = (mode, layer_shapes)
         if cache_key not in self._anchor_cache:
-            self._anchor_cache[cache_key] = generate_anchors(layer_shapes)
+            self._anchor_cache[cache_key] = generate_anchors(layer_shapes, custom_wh=self.anchor_wh)
         return self._anchor_cache[cache_key].to(device)
 
 

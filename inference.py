@@ -9,11 +9,20 @@ class AdaptiveInference:
                  checkpoint=None, pretrained_backbone=True):
         # 1. استدعاء محرك التكيف (DIC يعمل في خيط خلفي منفصل - غير حاجب)
         self.engine = AdaptiveEngine()
-        self.model = AdaptiveSSD(num_classes=num_classes, pretrained_backbone=pretrained_backbone)
 
+        # anchor_wh (إن وُجدت داخل الـcheckpoint) يجب تحميلها مع الأوزان
+        # دائماً: رؤوس التوقع تعلّمت إزاحات نسبية لأبعاد anchors محدَّدة وقت
+        # التدريب - استخدام أبعاد مختلفة الآن يُبطل معنى تلك الإزاحات.
+        anchor_wh = None
+        state_dict = None
         if checkpoint:
             ckpt = torch.load(checkpoint, map_location="cpu")
+            anchor_wh = ckpt.get("anchor_wh")
             state_dict = ckpt.get("model", ckpt)
+
+        self.model = AdaptiveSSD(num_classes=num_classes, pretrained_backbone=pretrained_backbone,
+                                  anchor_wh=anchor_wh)
+        if state_dict is not None:
             self.model.load_state_dict(state_dict)
 
         self.model.eval()  # وضع النموذج في طور الاستدلال (Inference) وليس التدريب

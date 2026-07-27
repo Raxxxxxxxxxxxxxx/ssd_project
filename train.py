@@ -18,10 +18,13 @@
 """
 
 import argparse
+import itertools
 import os
 import random
 import xml.etree.ElementTree as ET
 
+import cv2
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -29,9 +32,13 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision.ops import box_iou
 
 from assd_model import AdaptiveSSD, MODE_CONFIG
-from utils import VOC_CLASSES, preprocess, encode, center_to_corner
+from utils import VOC_CLASSES, preprocess, encode, center_to_corner, compute_layer_anchor_wh
 
-CLASS_TO_IDX = {name: idx for idx, name in enumerate(VOC_CLASSES)}
+# فهرسة بالأصناف الحقيقية العشرين فقط (0..19)، دون "background"، لأن match_anchors()
+# وevaluate.py يضيفان +1 لاحقاً لحجز الفهرس 0 للخلفية في مخرجات النموذج. تضمين
+# "background" هنا كان يُنتج فهرسة مُزاحة مسبقاً (1..20) فيتكرر الإزاحة مرتين
+# ويُخرج فهرساً خارج الحدود (21) عند "tvmonitor" أثناء حساب MultiBoxLoss.
+CLASS_TO_IDX = {name: idx for idx, name in enumerate(VOC_CLASSES[1:])}
 
 
 class VOCDataset(Dataset):
@@ -52,7 +59,6 @@ class VOCDataset(Dataset):
     def __getitem__(self, index):
         image_id = self.ids[index]
 
-        import cv2
         image_path = os.path.join(self.images_dir, f"{image_id}.jpg")
         frame = cv2.imread(image_path)
         h, w = frame.shape[:2]
@@ -94,6 +100,73 @@ def random_horizontal_flip(frame, boxes, p=0.5):
         boxes = boxes.clone()
         boxes[:, [0, 2]] = 1.0 - boxes[:, [2, 0]]
     return frame, boxes
+
+
+def random_color_jitter(frame, p=0.5):
+    """تشويش لوني عشوائي (سطوع/تباين/تشبع) - القسم 2.7. لا يغيّر الصناديق
+    إطلاقاً لأنه يعمل على قيم البكسل فقط."""
+    if random.random() >= p:
+        return frame
+
+    frame = frame.astype(np.float32)
+
+    if random.random() < 0.5:  # سطوع (Brightness)
+        frame += random.uniform(-32, 32)
+
+    if random.random() < 0.5:  # تباين (Contrast)
+        frame = 127.5 + (frame - 127.5) * random.uniform(0.7, 1.3)
+
+    frame = np.clip(frame, 0, 255).astype(np.uint8)
+
+    if random.random() < 0.5:  # تشبع (Saturation) عبر HSV
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV).astype(np.float32)
+        hsv[..., 1] *= random.uniform(0.7, 1.3)
+        hsv[..., 1] = np.clip(hsv[..., 1], 0, 255)
+        frame = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+
+    return frame
+
+
+def random_crop(frame, boxes, labels, min_scale=0.3, max_trials=20):
+    """اقتصاص عشوائي (Random Crop) مع تصحيح صناديق الحقيقة - القسم 2.7.
+    يُبقي فقط الصناديق التي يقع مركزها داخل منطقة الاقتصاص، ويعيد الصورة
+    الأصلية دون تعديل إذا فشلت كل المحاولات أو لم توجد صناديق أصلاً."""
+    if boxes.numel() == 0:
+        return frame, boxes, labels
+
+    h, w = frame.shape[:2]
+    boxes_np = boxes.numpy()
+
+    for _ in range(max_trials):
+        scale = random.uniform(min_scale, 1.0)
+        aspect = random.uniform(0.5, 2.0)
+        crop_w = min(int(w * scale * (aspect ** 0.5)), w)
+        crop_h = min(int(h * scale / (aspect ** 0.5)), h)
+        if crop_w < 10 or crop_h < 10:
+            continue
+
+        x1 = random.randint(0, w - crop_w)
+        y1 = random.randint(0, h - crop_h)
+        x2, y2 = x1 + crop_w, y1 + crop_h
+
+        cx = (boxes_np[:, 0] + boxes_np[:, 2]) / 2 * w
+        cy = (boxes_np[:, 1] + boxes_np[:, 3]) / 2 * h
+        keep = (cx >= x1) & (cx <= x2) & (cy >= y1) & (cy <= y2)
+        if not keep.any():
+            continue
+
+        cropped_frame = frame[y1:y2, x1:x2]
+        kept = boxes_np[keep]
+        new_boxes = np.empty_like(kept)
+        new_boxes[:, 0] = np.clip((kept[:, 0] * w - x1) / crop_w, 0, 1)
+        new_boxes[:, 1] = np.clip((kept[:, 1] * h - y1) / crop_h, 0, 1)
+        new_boxes[:, 2] = np.clip((kept[:, 2] * w - x1) / crop_w, 0, 1)
+        new_boxes[:, 3] = np.clip((kept[:, 3] * h - y1) / crop_h, 0, 1)
+
+        kept_labels = labels[torch.from_numpy(keep)]
+        return cropped_frame, torch.from_numpy(new_boxes).float(), kept_labels
+
+    return frame, boxes, labels
 
 
 def match_anchors(anchors, gt_boxes, gt_labels, iou_threshold=0.5):
@@ -171,12 +244,25 @@ class MultiBoxLoss(nn.Module):
         return loc_loss + cls_loss, loc_loss.item(), cls_loss.item()
 
 
-def train_one_epoch(model, loader, criterion, optimizer, device, modes):
+def train_one_epoch(model, loader, criterion, optimizer, device, mode_cycle):
     model.train()
     running_loss = 0.0
 
     for frames, boxes_list, labels_list in loader:
-        mode = random.choice(modes)
+        aug_frames, aug_boxes, aug_labels = [], [], []
+        for frame, boxes, labels in zip(frames, boxes_list, labels_list):
+            frame, boxes, labels = random_crop(frame, boxes, labels)
+            frame, boxes = random_horizontal_flip(frame, boxes)
+            frame = random_color_jitter(frame)
+            aug_frames.append(frame)
+            aug_boxes.append(boxes)
+            aug_labels.append(labels)
+        frames, boxes_list, labels_list = aug_frames, aug_boxes, aug_labels
+
+        # round-robin بدل اختيار عشوائي: يضمن أن كل وضع (TURBO/NORMAL/ECONOMY)
+        # يتلقى بالضبط ثلث الدُفعات (batches) عبر الحقبة كاملة، بدل تفاوت
+        # عشوائي قد يُحرم بعض الأوضاع من نصيبها العادل من إشارة التدريب.
+        mode = next(mode_cycle)
         resolution = MODE_CONFIG[mode]["resolution"]
 
         batch_tensors = torch.cat([preprocess(f, resolution) for f in frames], dim=0).to(device)
@@ -214,7 +300,10 @@ def main():
     parser.add_argument("--momentum", type=float, default=0.9)
     parser.add_argument("--weight-decay", type=float, default=5e-4)
     parser.add_argument("--lr-decay-epochs", nargs="+", type=int, default=[80, 100])
+    parser.add_argument("--warmup-epochs", type=int, default=5,
+                         help="عدد حقب الإحماء الخطي لمعدل التعلّم (LR warmup)")
     parser.add_argument("--checkpoint-dir", default="checkpoints")
+    parser.add_argument("--resume", default=None, help="مسار checkpoint لاستئناف التدريب منه")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
@@ -233,23 +322,72 @@ def main():
         collate_fn=collate_fn, num_workers=4, drop_last=True,
     )
 
-    model = AdaptiveSSD(num_classes=len(VOC_CLASSES)).to(device)
+    start_epoch = 1
+    anchor_wh = None
+
+    if args.resume:
+        # عند الاستئناف نُعيد استخدام anchor_wh المحفوظة مع النموذج نفسه (إن
+        # وُجدت)، لأن رؤوس التوقع تعلّمت إزاحات نسبية لهذه الأبعاد تحديداً -
+        # حساب K-Means من جديد هنا قد يُنتج أبعاداً مختلفة ويُبطل التدريب السابق.
+        ckpt = torch.load(args.resume, map_location=device)
+        anchor_wh = ckpt.get("anchor_wh")
+        start_epoch = ckpt.get("epoch", 0) + 1
+        print(f"استئناف التدريب من {args.resume} عند الحقبة {start_epoch}.")
+    else:
+        print("حساب K-Means anchors من التوزيع الحقيقي لصناديق VOC2012 (القسم 3.7)...")
+        anchor_wh = compute_layer_anchor_wh(dataset)
+        for name, wh in anchor_wh.items():
+            print(f"  {name}: {['(%.3f, %.3f)' % p for p in wh]}")
+
+    model = AdaptiveSSD(num_classes=len(VOC_CLASSES), anchor_wh=anchor_wh).to(device)
+    if args.resume:
+        model.load_state_dict(ckpt["model"])
+
     criterion = MultiBoxLoss(neg_pos_ratio=3)
     optimizer = torch.optim.SGD(
         model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay
     )
-    scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=args.lr_decay_epochs, gamma=0.1)
+    if args.resume and "optimizer" in ckpt:
+        optimizer.load_state_dict(ckpt["optimizer"])
 
-    modes = ["ECONOMY", "NORMAL", "TURBO"]
+    # جدولة LR: إحماء خطي (warmup) لأول عدة حقب ثم خفض عند lr_decay_epochs،
+    # كما في التقرير (قسم 2.7) مع إضافة الإحماء (ممارسة قياسية لتحسين
+    # الاستقرار في أول الحقب، غير مذكورة بالتقرير لكنها لا تتعارض معه).
+    warmup_epochs = max(0, args.warmup_epochs)
+    decay_milestones = [max(1, m - warmup_epochs) for m in args.lr_decay_epochs]
+    main_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=decay_milestones, gamma=0.1)
+    if warmup_epochs > 0:
+        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=0.1, total_iters=warmup_epochs
+        )
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer, schedulers=[warmup_scheduler, main_scheduler], milestones=[warmup_epochs]
+        )
+    else:
+        scheduler = main_scheduler
 
-    print(f"بدء التدريب على {device} لعدد {len(dataset)} صورة، {args.epochs} حقبة (epoch).")
-    for epoch in range(1, args.epochs + 1):
-        avg_loss = train_one_epoch(model, loader, criterion, optimizer, device, modes)
+    # نُنشئ الدوّار (cycle) مرة واحدة فقط ونمرّره لكل استدعاء train_one_epoch
+    # حتى يستمر التوزيع المتساوي عبر حدود الحقب (لا يُعاد ضبطه كل حقبة).
+    mode_cycle = itertools.cycle(["TURBO", "NORMAL", "ECONOMY"])
+
+    print(f"بدء التدريب على {device} لعدد {len(dataset)} صورة، من الحقبة {start_epoch} حتى {args.epochs}.")
+    for epoch in range(start_epoch, args.epochs + 1):
+        avg_loss = train_one_epoch(model, loader, criterion, optimizer, device, mode_cycle)
         scheduler.step()
         print(f"Epoch {epoch}/{args.epochs} - loss: {avg_loss:.4f} - lr: {scheduler.get_last_lr()[0]:.6f}")
 
-        ckpt_path = os.path.join(args.checkpoint_dir, "last.pth")
-        torch.save({"model": model.state_dict(), "epoch": epoch}, ckpt_path)
+        ckpt_data = {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "epoch": epoch,
+            "anchor_wh": anchor_wh,
+        }
+        torch.save(ckpt_data, os.path.join(args.checkpoint_dir, "last.pth"))
+
+        # نسخة دورية كل 10 حقب (بالإضافة إلى last.pth) لتقييم التقدّم أثناء
+        # تدريب طويل غير مراقب عبر evaluate.py دون انتظار الاكتمال الكامل.
+        if epoch % 10 == 0 or epoch == args.epochs:
+            torch.save(ckpt_data, os.path.join(args.checkpoint_dir, f"epoch_{epoch}.pth"))
 
     print(f"اكتمل التدريب. آخر نسخة محفوظة في: {os.path.join(args.checkpoint_dir, 'last.pth')}")
 

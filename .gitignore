@@ -11,3 +11,10 @@ __pycache__/
 
 # ملفات نظام
 .DS_Store
+
+# حالة أدوات محلية (Claude Code) - ليست جزءاً من المشروع
+.claude/
+
+# نسخ checkpoints المرحلية (كل 10 حقب) - شبكة أمان محلية أثناء التدريب فقط،
+# ليست ضرورية على GitHub؛ نحتفظ فقط بـ last.pth لكل مجلد checkpoints
+checkpoints_v2/epoch_*.pth

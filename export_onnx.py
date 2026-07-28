@@ -57,6 +57,17 @@ def main():
     )
     print(f"تم التصدير إلى {output_path} (وضع {args.mode}, دقة {resolution})")
 
+    # نحفظ صناديق الإرساء (anchors) كملف .npy منفصل بجانب النموذج المُصدَّر.
+    # ضروري لأي نشر لا يعتمد على PyTorch إطلاقاً (Raspberry Pi + TFLite فقط):
+    # فك الترميز (decode) يحتاج نفس anchors التي دُرِّب النموذج على إزاحات
+    # نسبية لها تحديداً - حسابها من جديد بصيغة مختلفة عن طريق الخطأ يُنتج
+    # صناديق خاطئة تماماً رغم أن النموذج نفسه يعمل بشكل صحيح.
+    with torch.no_grad():
+        _, _, anchors = model(dummy_input, mode=args.mode)
+    anchors_path = output_path.rsplit(".", 1)[0] + "_anchors.npy"
+    np.save(anchors_path, anchors.numpy())
+    print(f"صناديق الإرساء محفوظة في: {anchors_path} (شكل: {tuple(anchors.shape)})")
+
     # التحقق الفعلي: تشغيل الملف المُصدَّر عبر onnxruntime ومقارنته بمخرجات
     # PyTorch الأصلية على نفس المدخل - وليس فقط افتراض أن التصدير نجح.
     import onnxruntime as ort

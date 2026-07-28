@@ -24,8 +24,7 @@ import time
 import cv2
 from flask import Flask, Response, jsonify, render_template_string
 
-from inference import AdaptiveInference
-from run_camera import draw_detections, MODE_COLORS
+from run_camera import build_system, draw_detections, MODE_COLORS
 from utils import VOC_CLASSES
 
 app = Flask(__name__)
@@ -68,12 +67,12 @@ INDEX_HTML = """
 class StreamWorker:
     """يلتقط الفريمات ويشغّل الاستدلال في خيط خلفي مستقل عن خدمة HTTP."""
 
-    def __init__(self, source, checkpoint=None):
+    def __init__(self, source, checkpoint=None, backend="pytorch", exports_dir="exports", tflite_float=False):
         self.cap = cv2.VideoCapture(source)
         if not self.cap.isOpened():
             raise RuntimeError(f"تعذّر فتح مصدر الفيديو: {source}")
 
-        self.system = AdaptiveInference(num_classes=len(VOC_CLASSES), checkpoint=checkpoint)
+        self.system = build_system(backend, checkpoint, exports_dir, tflite_float)
 
         self._lock = threading.Lock()
         self._latest_jpeg = None
@@ -159,13 +158,17 @@ def main():
     global worker
     parser = argparse.ArgumentParser(description="خادم بث فيديو حي لنموذج A-SSD")
     parser.add_argument("--source", default="0", help="رقم الكاميرا (0) أو مسار فيديو أو رابط RTSP")
-    parser.add_argument("--checkpoint", default=None, help="مسار نسخة النموذج المدرَّبة (اختياري)")
+    parser.add_argument("--backend", default="pytorch", choices=["pytorch", "onnx", "tflite"])
+    parser.add_argument("--checkpoint", default=None, help="لـ backend=pytorch")
+    parser.add_argument("--exports-dir", default="exports", help="لـ backend=tflite")
+    parser.add_argument("--tflite-float", action="store_true", help="float16 بدل INT8 لـ backend=tflite")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
 
     source = int(args.source) if args.source.isdigit() else args.source
-    worker = StreamWorker(source=source, checkpoint=args.checkpoint)
+    worker = StreamWorker(source=source, checkpoint=args.checkpoint, backend=args.backend,
+                           exports_dir=args.exports_dir, tflite_float=args.tflite_float)
 
     print(f"البث متاح على: http://{args.host}:{args.port}  (اضغط Ctrl+C للإيقاف)")
     try:

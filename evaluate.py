@@ -10,6 +10,7 @@
 import argparse
 from collections import defaultdict
 
+import cv2
 import torch
 from torchvision.ops import box_iou
 
@@ -32,10 +33,12 @@ def compute_ap(recalls, precisions):
     return ap
 
 
-@torch.no_grad()
-def evaluate(model, dataset, mode, conf_thresh=0.01, nms_thresh=0.45, iou_thresh=0.5, device="cpu"):
-    model.eval()
-
+def evaluate(dataset, detect_fn, iou_thresh=0.5):
+    """
+    يحسب mAP@0.5 بغضّ النظر عن مصدر الاكتشافات - detect_fn(frame) -> قائمة
+    (box, class_id, score) هي الواجهة الوحيدة المطلوبة. هذا يسمح بإعادة
+    استخدام نفس منطق حساب AP لأي backend (PyTorch أو TFLite) دون تكرار.
+    """
     # لكل صنف: قائمة (confidence, is_true_positive) ولكل صورة: صناديق الحقيقة المتبقية غير المطابَقة
     all_predictions = defaultdict(list)
     all_gts_by_class = defaultdict(dict)  # class_id -> {image_idx: {"boxes":..., "matched":[bool,...]}}
@@ -57,14 +60,7 @@ def evaluate(model, dataset, mode, conf_thresh=0.01, nms_thresh=0.45, iou_thresh
             entry["matched"].append(False)
             num_gt_per_class[class_id] += 1
 
-        from assd_model import MODE_CONFIG
-        resolution = MODE_CONFIG[mode]["resolution"]
-        input_tensor = preprocess(frame, resolution).to(device)
-        loc_preds, cls_preds, anchors = model(input_tensor, mode=mode)
-        detections = postprocess(
-            loc_preds, cls_preds, anchors, orig_size=(w, h),
-            conf_thresh=conf_thresh, nms_thresh=nms_thresh, top_k=200,
-        )
+        detections = detect_fn(frame)
 
         for box, class_id, score in detections:
             all_predictions[class_id].append((score, idx, box))
@@ -113,23 +109,108 @@ def main():
     parser = argparse.ArgumentParser(description="حساب mAP@0.5 لنموذج A-SSD مدرَّب")
     parser.add_argument("--data-root", required=True)
     parser.add_argument("--split", default="val")
-    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--checkpoint", default=None, help="مطلوب لـ backend=pytorch")
     parser.add_argument("--mode", default="NORMAL", choices=["ECONOMY", "NORMAL", "TURBO"])
+    parser.add_argument("--backend", default="pytorch", choices=["pytorch", "tflite", "onnx"])
+    parser.add_argument("--exports-dir", default="exports", help="لـ backend=tflite/onnx")
+    parser.add_argument("--tflite-float", action="store_true",
+                         help="استخدام float16 بدل INT8 الكامل لـ backend=tflite")
+    parser.add_argument("--conf-thresh", type=float, default=0.01)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
     device = torch.device(args.device)
     dataset = VOCDataset(args.data_root, split=args.split)
 
-    ckpt = torch.load(args.checkpoint, map_location=device)
-    # anchor_wh (إن وُجدت) يجب تحميلها مع الأوزان دائماً: رؤوس التوقع تعلّمت
-    # إزاحات نسبية لأبعاد anchors محدَّدة وقت التدريب (K-Means أو الصيغة
-    # الافتراضية) - استخدام أبعاد مختلفة هنا يُبطل معنى تلك الإزاحات.
-    model = AdaptiveSSD(num_classes=len(VOC_CLASSES), anchor_wh=ckpt.get("anchor_wh")).to(device)
-    model.load_state_dict(ckpt.get("model", ckpt))
+    if args.backend == "pytorch":
+        ckpt = torch.load(args.checkpoint, map_location=device)
+        # anchor_wh (إن وُجدت) يجب تحميلها مع الأوزان دائماً: رؤوس التوقع تعلّمت
+        # إزاحات نسبية لأبعاد anchors محدَّدة وقت التدريب (K-Means أو الصيغة
+        # الافتراضية) - استخدام أبعاد مختلفة هنا يُبطل معنى تلك الإزاحات.
+        model = AdaptiveSSD(num_classes=len(VOC_CLASSES), anchor_wh=ckpt.get("anchor_wh")).to(device)
+        model.load_state_dict(ckpt.get("model", ckpt))
+        model.eval()
 
-    print(f"تقييم على {len(dataset)} صورة ({args.split}) بوضع {args.mode}...")
-    aps = evaluate(model, dataset, mode=args.mode, device=device)
+        from assd_model import MODE_CONFIG
+        resolution = MODE_CONFIG[args.mode]["resolution"]
+
+        @torch.no_grad()
+        def detect_fn(frame):
+            h, w = frame.shape[:2]
+            input_tensor = preprocess(frame, resolution).to(device)
+            loc_preds, cls_preds, anchors = model(input_tensor, mode=args.mode)
+            return postprocess(loc_preds, cls_preds, anchors, orig_size=(w, h),
+                                conf_thresh=args.conf_thresh, nms_thresh=0.45, top_k=200)
+    elif args.backend == "onnx":
+        from onnx_inference import ONNXAdaptiveInference
+        from tflite_inference import softmax_numpy, postprocess_numpy, MODE_RESOLUTIONS
+
+        onnx_inf = ONNXAdaptiveInference(exports_dir=args.exports_dir, conf_thresh=args.conf_thresh)
+        onnx_inf.engine.stop()
+        session = onnx_inf.sessions[args.mode]
+        anchors = onnx_inf.anchors[args.mode]
+        input_name = session.get_inputs()[0].name
+
+        def detect_fn(frame):
+            import numpy as np
+            from utils import IMAGENET_MEAN, IMAGENET_STD
+
+            resolution = MODE_RESOLUTIONS[args.mode]
+            h, w = frame.shape[:2]
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            resized = cv2.resize(rgb, resolution).astype(np.float32) / 255.0
+            normalized = (resized - np.array(IMAGENET_MEAN, dtype=np.float32)) / np.array(IMAGENET_STD, dtype=np.float32)
+            input_data = normalized.transpose(2, 0, 1)[np.newaxis, ...]
+
+            outputs = session.run(None, {input_name: input_data})
+            outputs_by_shape = {o.shape[-1]: o[0] for o in outputs}
+            scores = softmax_numpy(outputs_by_shape[len(VOC_CLASSES)], axis=-1)
+            return postprocess_numpy(outputs_by_shape[4], scores, anchors, (w, h),
+                                      conf_thresh=args.conf_thresh, nms_thresh=0.45, top_k=200)
+    else:
+        from tflite_inference import TFLiteAdaptiveInference
+
+        tf_inf = TFLiteAdaptiveInference(exports_dir=args.exports_dir, quantized=not args.tflite_float,
+                                          conf_thresh=args.conf_thresh)
+        tf_inf.engine.stop()  # لا حاجة لخيط DIC هنا - الوضع ثابت طوال التقييم
+        interp = tf_inf.interpreters[args.mode]
+        anchors = tf_inf.anchors[args.mode]
+
+        def detect_fn(frame):
+            from tflite_inference import MODE_RESOLUTIONS, softmax_numpy, postprocess_numpy
+            import cv2
+            import numpy as np
+            from utils import IMAGENET_MEAN, IMAGENET_STD
+
+            resolution = MODE_RESOLUTIONS[args.mode]
+            h, w = frame.shape[:2]
+            input_details = interp.get_input_details()[0]
+            output_details = interp.get_output_details()
+
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            resized = cv2.resize(rgb, resolution).astype(np.float32) / 255.0
+            normalized = (resized - np.array(IMAGENET_MEAN, dtype=np.float32)) / np.array(IMAGENET_STD, dtype=np.float32)
+            input_data = normalized[np.newaxis, ...]
+            if np.issubdtype(input_details["dtype"], np.integer):
+                scale, zp = input_details["quantization"]
+                input_data = np.round(input_data / scale + zp).astype(input_details["dtype"])
+            interp.set_tensor(input_details["index"], input_data)
+            interp.invoke()
+
+            outputs = {}
+            for d in output_details:
+                val = interp.get_tensor(d["index"])[0]
+                if np.issubdtype(d["dtype"], np.integer):
+                    scale, zp = d["quantization"]
+                    val = (val.astype(np.float32) - zp) * scale
+                outputs[val.shape[-1]] = val
+
+            scores = softmax_numpy(outputs[len(VOC_CLASSES)], axis=-1)
+            return postprocess_numpy(outputs[4], scores, anchors, (w, h),
+                                      conf_thresh=args.conf_thresh, nms_thresh=0.45, top_k=200)
+
+    print(f"تقييم على {len(dataset)} صورة ({args.split}) بوضع {args.mode}, backend={args.backend}...")
+    aps = evaluate(dataset, detect_fn)
 
     print("\n--- الدقة لكل صنف (AP) ---")
     for class_id, ap in sorted(aps.items()):

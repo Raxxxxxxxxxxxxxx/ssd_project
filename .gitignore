@@ -1,6 +1,13 @@
 # البيئة الافتراضية - لا تُرفع أبداً (ضخمة، وقابلة لإعادة الإنشاء عبر requirements.txt)
 assd_env/
 
+# بيئة معزولة لتحويل TFLite فقط (Python 3.11 + TensorFlow) - راجع export_tflite.py
+tflite_env/
+
+# ملف معايرة وهمي يُنشئه export_tflite.py تلقائياً عند الحاجة
+calibration_image_sample_data_*.npy
+calib_real_int8.npy
+
 # مجموعة بيانات VOC2012 - عامة ومتاحة للتحميل مباشرة (~2GB)، ليست ملكاً للمشروع
 # لتحميلها: راجع تعليمات train.py (--data-root) أو NEXT_STEPS.md
 data/

@@ -50,10 +50,18 @@ def main():
     resolution = MODE_CONFIG[args.mode]["resolution"]
     dummy_input = torch.randn(1, 3, resolution[1], resolution[0])
 
+    # dynamo=False: يفرض المُصدِّر القديم (TorchScript-based). المُصدِّر
+    # الجديد الافتراضي بإصدارات PyTorch الحديثة يدعم فقط ترجمة opset 18
+    # داخلياً، ثم يحاول تحويلها لـopset الأدنى المطلوب عبر onnxscript - هذا
+    # التحويل فشل فعلياً هنا (خطأ في onnxscript.version_converter) وأبقى
+    # الملف بـopset 18 وIR version 10، وهو ما رفضه onnxruntime 1.10.0 على
+    # Jetson Nano (JetPack قديم، بايثون 3.6): "Unsupported model IR version:
+    # 10, max supported IR version: 8". المُصدِّر القديم يكتب opset 13 /
+    # IR version 7 مباشرة بدون الحاجة لأي تحويل لاحق.
     torch.onnx.export(
         wrapped, dummy_input, output_path,
         input_names=["input"], output_names=["loc", "cls"],
-        opset_version=18,
+        opset_version=13, dynamo=False,
     )
     print(f"تم التصدير إلى {output_path} (وضع {args.mode}, دقة {resolution})")
 

@@ -56,7 +56,7 @@ def benchmark_pytorch(args):
 def benchmark_onnx(args):
     import numpy as np
     import onnxruntime as ort
-    from assd_model import MODE_CONFIG
+    from utils import MODE_CONFIG
 
     print(f"الجهاز: CPU (ONNX Runtime) | onnxruntime {ort.__version__}")
     sessions = {}

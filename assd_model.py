@@ -1,14 +1,7 @@
 import torch
 import torch.nn as nn
 from backbone import MobileNetV3Backbone
-from utils import LAYER_NUM_ANCHORS, generate_anchors
-
-# دقة الإدخال والطبقات المفعّلة لكل وضع تشغيل (ARM + DFMS، القسمان 3.4 و3.5)
-MODE_CONFIG = {
-    "TURBO":   {"resolution": (320, 320)},
-    "NORMAL":  {"resolution": (300, 300)},
-    "ECONOMY": {"resolution": (224, 224)},
-}
+from utils import LAYER_NUM_ANCHORS, generate_anchors, MODE_CONFIG  # noqa: F401 (يُعاد تصديره لبقية الكود)
 
 
 class AdaptiveSSD(nn.Module):

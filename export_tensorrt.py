@@ -46,7 +46,9 @@ def build_with_trtexec(onnx_path, output_path, fp16=True, workspace_mb=1024):
         cmd.append("--fp16")
 
     print("تشغيل:", " ".join(cmd))
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    # capture_output/text (بايثون 3.7+) غير مدعومين على بايثون 3.6.9 الذي
+    # يأتي افتراضياً مع JetPack على Jetson Nano - نستخدم البديل المتوافق.
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
     print(result.stdout[-3000:])
     if result.returncode != 0:
         print(result.stderr[-3000:], file=sys.stderr)
@@ -78,12 +80,40 @@ def verify_engine(engine_path):
         engine = runtime.deserialize_cuda_engine(f.read())
     context = engine.create_execution_context()
 
-    input_shape = engine.get_tensor_shape(engine.get_tensor_name(0))
-    dummy_input = np.random.randn(*input_shape).astype(np.float32)
+    # واجهة bindings القديمة (num_bindings/get_binding_shape/binding_is_input)
+    # وليس get_tensor_name/get_tensor_shape الأحدث (TensorRT >=8.5) - الإصدار
+    # المتوفر فعلياً على Jetson Nano عبر JetPack هو 8.2.1. أيضاً: execute_v2
+    # يحتاج تخصيص ذاكرة GPU لكل الـbindings (المدخل وكل المخرجات معاً، نموذجنا
+    # له مخرجان loc/cls) وليس فقط المدخل، وإلا تحطّم البرنامج (segfault).
+    bindings = []
+    # يجب الاحتفاظ بمرجع بايثون لكل تخصيصات الذاكرة (device_buffers) طوال
+    # مدة execute_v2 - تخزين العنوان الرقمي فقط (int(device_mem)) بـbindings
+    # لا يكفي: بمجرد ما تفقد حلقة for آخر مرجع لكائن device_mem (كل تكرار
+    # جديد يستبدل المتغيّر)، يحرّره garbage collector فوراً، فيصبح المؤشر
+    # المخزَّن بـbindings يشير لذاكرة محرَّرة فعلياً - هذا بالضبط ما كان
+    # يسبب "unspecified launch failure" (عطل CUDA فادح يُفسد الجلسة كاملة).
+    device_buffers = []
+    host_outputs = []
+    for i in range(engine.num_bindings):
+        shape = engine.get_binding_shape(i)
+        dtype = trt.nptype(engine.get_binding_dtype(i))
+        if engine.binding_is_input(i):
+            host_mem = np.random.randn(*shape).astype(dtype)
+        else:
+            host_mem = np.empty(shape, dtype=dtype)
+        device_mem = cuda.mem_alloc(host_mem.nbytes)
+        device_buffers.append(device_mem)
+        bindings.append(int(device_mem))
+        if engine.binding_is_input(i):
+            cuda.memcpy_htod(device_mem, host_mem)
+        else:
+            host_outputs.append((host_mem, device_mem))
 
-    d_input = cuda.mem_alloc(dummy_input.nbytes)
-    cuda.memcpy_htod(d_input, dummy_input)
-    context.execute_v2([int(d_input)])
+    context.execute_v2(bindings)
+
+    for host_mem, device_mem in host_outputs:
+        cuda.memcpy_dtoh(host_mem, device_mem)
+        assert np.isfinite(host_mem).all(), "مخرجات غير منطقية (NaN/Inf) من محرك TensorRT"
 
     print("التحقق ناجح: محرك TensorRT يعمل فعلياً (استدلال حقيقي بدون عطل).")
 

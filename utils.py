@@ -10,8 +10,16 @@
 import math
 import cv2
 import numpy as np
-import torch
-from torchvision.ops import nms as torch_nms
+
+try:
+    import torch
+    from torchvision.ops import nms as torch_nms
+except ImportError:
+    # غير مطلوبة لمسار onnx_inference.py (torch-free) - يستخدم فقط الثوابت
+    # أدناه (VOC_CLASSES وغيرها). تبقى مطلوبة لمسارات PyTorch (train.py،
+    # inference.py، evaluate.py).
+    torch = None
+    torch_nms = None
 
 # إحصائيات تطبيع ImageNet التي دُرِّب عليها MobileNetV3-Small مسبقاً
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
@@ -19,6 +27,15 @@ IMAGENET_STD = (0.229, 0.224, 0.225)
 
 # متغيرات الترميز القياسية في SSD لتحويل إزاحات الشبكة إلى إحداثيات فعلية
 VARIANCES = (0.1, 0.1, 0.2, 0.2)
+
+# دقة الإدخال لكل وضع تشغيل (ARM + DFMS، القسمان 3.4 و3.5). مُعرَّفة هنا (لا
+# torch) حتى يقدر مسار onnx_inference.py/benchmark.py الخفيف قراءتها بدون
+# استيراد assd_model.py (الذي يستورد torch لتعريف nn.Module).
+MODE_CONFIG = {
+    "TURBO":   {"resolution": (320, 320)},
+    "NORMAL":  {"resolution": (300, 300)},
+    "ECONOMY": {"resolution": (224, 224)},
+}
 
 # إعداد كل طبقة: k = عدد الـ Anchors في كل موقع، scale/next_scale لحساب الأبعاد،
 # ratios = نسب الأبعاد المستخدمة. هذا الترتيب ثابت بغض النظر عن عدد الطبقات

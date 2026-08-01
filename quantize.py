@@ -156,7 +156,7 @@ def main():
 
     with torch.no_grad():
         for i in range(min(args.calib_images, len(dataset))):
-            frame, _, _ = dataset[i]
+            frame, _, _, _ = dataset[i]
             tensor = preprocess(frame, resolution)
             wrapped(tensor)
 
@@ -178,7 +178,7 @@ def main():
     print(f"النسخة المُكمَّمة محفوظة في: {output_path}")
 
     # التحقق الفعلي: تشغيل استدلال حقيقي بالنموذج المُكمَّم على صورة حقيقية
-    frame, _, _ = dataset[0]
+    frame, _, _, _ = dataset[0]
     tensor = preprocess(frame, resolution)
     with torch.no_grad():
         loc, cls = wrapped(tensor)

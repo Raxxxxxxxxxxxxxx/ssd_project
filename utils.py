@@ -232,7 +232,7 @@ def compute_layer_anchor_wh(dataset):
     """
     all_wh = []
     for i in range(len(dataset)):
-        _, boxes, _ = dataset[i]
+        _, boxes, _, _ = dataset[i]
         if boxes.numel() == 0:
             continue
         wh = (boxes[:, 2:] - boxes[:, :2]).numpy()

@@ -28,7 +28,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Subset
 from torchvision.ops import box_iou
 
 from assd_model import AdaptiveSSD, MODE_CONFIG
@@ -63,15 +63,17 @@ class VOCDataset(Dataset):
         frame = cv2.imread(image_path)
         h, w = frame.shape[:2]
 
-        boxes, labels = self._parse_annotation(image_id, w, h)
-        return frame, boxes, labels
+        boxes, labels, difficult = self._parse_annotation(image_id, w, h)
+        return frame, boxes, labels, difficult
 
     def _parse_annotation(self, image_id, img_w, img_h):
-        """يستخرج صناديق الحقيقة وأصنافها، مُطبَّعة بين 0 و1 (صيغة corner)."""
+        """يستخرج صناديق الحقيقة وأصنافها وعلامة difficult، مُطبَّعة بين 0 و1 (صيغة corner).
+        علامة difficult تُستخدم فقط لاستثناء الجسم من حساب mAP في evaluate.py
+        (بروتوكول VOC القياسي) - التدريب يستخدم كل الأجسام بلا استثناء."""
         ann_path = os.path.join(self.annotations_dir, f"{image_id}.xml")
         root = ET.parse(ann_path).getroot()
 
-        boxes, labels = [], []
+        boxes, labels, difficult = [], [], []
         for obj in root.findall("object"):
             name = obj.find("name").text.strip().lower()
             if name not in CLASS_TO_IDX:
@@ -83,14 +85,18 @@ class VOCDataset(Dataset):
             ymax = float(bbox.find("ymax").text) / img_h
             boxes.append([xmin, ymin, xmax, ymax])
             labels.append(CLASS_TO_IDX[name])
+            diff_tag = obj.find("difficult")
+            difficult.append(int(diff_tag.text) if diff_tag is not None else 0)
 
-        return torch.tensor(boxes, dtype=torch.float32), torch.tensor(labels, dtype=torch.long)
+        return (torch.tensor(boxes, dtype=torch.float32),
+                torch.tensor(labels, dtype=torch.long),
+                torch.tensor(difficult, dtype=torch.long))
 
 
 def collate_fn(batch):
     """كل صورة قد تحوي عدداً مختلفاً من الأجسام، لذا نُبقي القوائم كما هي."""
-    frames, boxes, labels = zip(*batch)
-    return list(frames), list(boxes), list(labels)
+    frames, boxes, labels, difficult = zip(*batch)
+    return list(frames), list(boxes), list(labels), list(difficult)
 
 
 def random_horizontal_flip(frame, boxes, p=0.5):
@@ -245,10 +251,13 @@ class MultiBoxLoss(nn.Module):
 
 
 def train_one_epoch(model, loader, criterion, optimizer, device, mode_cycle):
+    """يعيد قاموس خسارة منفصل لكل وضع {"TURBO":..,"NORMAL":..,"ECONOMY":..,"all":..}
+    بدل رقم واحد مجمّع، حتى يظهر إن كان وضع معيّن يتعلّم أبطأ من غيره."""
     model.train()
-    running_loss = 0.0
+    running_loss = {"TURBO": 0.0, "NORMAL": 0.0, "ECONOMY": 0.0}
+    batch_count = {"TURBO": 0, "NORMAL": 0, "ECONOMY": 0}
 
-    for frames, boxes_list, labels_list in loader:
+    for frames, boxes_list, labels_list, _ in loader:
         aug_frames, aug_boxes, aug_labels = [], [], []
         for frame, boxes, labels in zip(frames, boxes_list, labels_list):
             frame, boxes, labels = random_crop(frame, boxes, labels)
@@ -285,9 +294,38 @@ def train_one_epoch(model, loader, criterion, optimizer, device, mode_cycle):
         loss.backward()
         optimizer.step()
 
-        running_loss += loss.item()
+        running_loss[mode] += loss.item()
+        batch_count[mode] += 1
 
-    return running_loss / max(len(loader), 1)
+    avg_loss = {m: running_loss[m] / max(batch_count[m], 1) for m in running_loss}
+    total_batches = sum(batch_count.values())
+    avg_loss["all"] = sum(running_loss.values()) / max(total_batches, 1)
+    return avg_loss
+
+
+@torch.no_grad()
+def _quick_eval(model, val_dataset, device, mode="NORMAL"):
+    """تقييم mAP@0.5 سريع بالنموذج الحالي في الذاكرة (بلا إعادة تحميل من قرص)،
+    يُستخدم للتقييم الدوري أثناء التدريب (--eval-every) ولتتبّع أفضل نسخة."""
+    from evaluate import evaluate as run_eval
+    from assd_model import MODE_CONFIG as _MODE_CONFIG
+    from utils import postprocess
+
+    was_training = model.training
+    model.eval()
+    resolution = _MODE_CONFIG[mode]["resolution"]
+
+    def detect_fn(frame):
+        h, w = frame.shape[:2]
+        input_tensor = preprocess(frame, resolution).to(device)
+        loc_preds, cls_preds, anchors = model(input_tensor, mode=mode)
+        return postprocess(loc_preds, cls_preds, anchors, orig_size=(w, h),
+                            conf_thresh=0.01, nms_thresh=0.45, top_k=200)
+
+    aps = run_eval(val_dataset, detect_fn)
+    if was_training:
+        model.train()
+    return sum(aps.values()) / max(len(aps), 1)
 
 
 def main():
@@ -299,13 +337,28 @@ def main():
     parser.add_argument("--lr", type=float, default=0.001)
     parser.add_argument("--momentum", type=float, default=0.9)
     parser.add_argument("--weight-decay", type=float, default=5e-4)
-    parser.add_argument("--lr-decay-epochs", nargs="+", type=int, default=[80, 100])
+    parser.add_argument("--lr-decay-epochs", nargs="+", type=int, default=None,
+                         help="حقب خفض معدل التعلّم. افتراضياً (إن لم تُحدَّد) تُشتق تلقائياً "
+                              "كنسبة 70%% و90%% من --epochs، حتى لا تفقد القيمة الافتراضية "
+                              "الثابتة [80,100] أثرها عند تغيير --epochs (مثلاً لجولات ablation قصيرة).")
     parser.add_argument("--warmup-epochs", type=int, default=5,
                          help="عدد حقب الإحماء الخطي لمعدل التعلّم (LR warmup)")
     parser.add_argument("--checkpoint-dir", default="checkpoints")
     parser.add_argument("--resume", default=None, help="مسار checkpoint لاستئناف التدريب منه")
+    parser.add_argument("--eval-every", type=int, default=10,
+                         help="تقييم mAP دوري كل كم حقبة أثناء التدريب، مع حفظ أفضل نسخة "
+                              "(best.pth). صفر لتعطيله.")
+    parser.add_argument("--eval-split", default="val", help="اسم split للتقييم الدوري أثناء التدريب")
+    parser.add_argument("--eval-subset", type=int, default=200,
+                         help="عدد صور عشوائية (بذرة ثابتة) من eval-split للتقييم الدوري "
+                              "السريع أثناء التدريب. صفر = المجموعة كاملة (أبطأ).")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
+
+    if args.lr_decay_epochs is None:
+        args.lr_decay_epochs = [max(1, round(args.epochs * 0.7)), max(1, round(args.epochs * 0.9))]
+        print(f"لم يُحدَّد --lr-decay-epochs، اشتُقّ تلقائياً من --epochs={args.epochs}: "
+              f"{args.lr_decay_epochs} (يترك حقباً بعد آخر خفض للتقارب، خلافاً لـ[80,100] الثابت سابقاً).")
 
     if not os.path.isdir(args.data_root):
         raise SystemExit(
@@ -321,6 +374,22 @@ def main():
         dataset, batch_size=args.batch_size, shuffle=True,
         collate_fn=collate_fn, num_workers=4, drop_last=True,
     )
+
+    val_dataset = None
+    if args.eval_every > 0:
+        try:
+            full_val = VOCDataset(args.data_root, split=args.eval_split)
+            if 0 < args.eval_subset < len(full_val):
+                rng = random.Random(42)
+                indices = rng.sample(range(len(full_val)), args.eval_subset)
+                val_dataset = Subset(full_val, indices)
+            else:
+                val_dataset = full_val
+            print(f"تقييم دوري مفعّل كل {args.eval_every} حقبة على {len(val_dataset)} "
+                  f"صورة من split={args.eval_split} (أفضل نسخة تُحفظ في best.pth).")
+        except FileNotFoundError:
+            print(f"تحذير: split={args.eval_split} غير موجود - تعطيل التقييم الدوري وbest.pth.")
+            args.eval_every = 0
 
     start_epoch = 1
     anchor_wh = None
@@ -370,11 +439,14 @@ def main():
     # حتى يستمر التوزيع المتساوي عبر حدود الحقب (لا يُعاد ضبطه كل حقبة).
     mode_cycle = itertools.cycle(["TURBO", "NORMAL", "ECONOMY"])
 
+    best_map = -1.0
     print(f"بدء التدريب على {device} لعدد {len(dataset)} صورة، من الحقبة {start_epoch} حتى {args.epochs}.")
     for epoch in range(start_epoch, args.epochs + 1):
         avg_loss = train_one_epoch(model, loader, criterion, optimizer, device, mode_cycle)
         scheduler.step()
-        print(f"Epoch {epoch}/{args.epochs} - loss: {avg_loss:.4f} - lr: {scheduler.get_last_lr()[0]:.6f}")
+        print(f"Epoch {epoch}/{args.epochs} - loss(all): {avg_loss['all']:.4f} "
+              f"[TURBO {avg_loss['TURBO']:.4f} | NORMAL {avg_loss['NORMAL']:.4f} | "
+              f"ECONOMY {avg_loss['ECONOMY']:.4f}] - lr: {scheduler.get_last_lr()[0]:.6f}")
 
         ckpt_data = {
             "model": model.state_dict(),
@@ -389,7 +461,17 @@ def main():
         if epoch % 10 == 0 or epoch == args.epochs:
             torch.save(ckpt_data, os.path.join(args.checkpoint_dir, f"epoch_{epoch}.pth"))
 
+        if args.eval_every > 0 and (epoch % args.eval_every == 0 or epoch == args.epochs):
+            mean_ap = _quick_eval(model, val_dataset, device, mode="NORMAL")
+            print(f"  [تقييم دوري] mAP@0.5 (NORMAL, {len(val_dataset)} صورة) عند الحقبة {epoch}: {mean_ap * 100:.2f}%")
+            if mean_ap > best_map:
+                best_map = mean_ap
+                torch.save(ckpt_data, os.path.join(args.checkpoint_dir, "best.pth"))
+                print(f"  [أفضل نسخة جديدة] حُفظت في best.pth (mAP={mean_ap * 100:.2f}%)")
+
     print(f"اكتمل التدريب. آخر نسخة محفوظة في: {os.path.join(args.checkpoint_dir, 'last.pth')}")
+    if best_map >= 0:
+        print(f"أفضل نسخة أثناء التدريب: {os.path.join(args.checkpoint_dir, 'best.pth')} (mAP={best_map * 100:.2f}%)")
 
 
 if __name__ == "__main__":

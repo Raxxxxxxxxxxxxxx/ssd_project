@@ -1,3 +1,5 @@
+import csv
+import os
 import time
 import threading
 import psutil
@@ -8,6 +10,11 @@ MODE_SETTINGS = {
     "NORMAL":  {"resolution": (300, 300), "layers_count": 3},
     "ECONOMY": {"resolution": (224, 224), "layers_count": 2},
 }
+
+EVENT_LOG_HEADER = [
+    "timestamp", "old_mode", "new_mode", "dwell_seconds",
+    "cpu_usage", "ram_usage", "battery", "temperature", "reason",
+]
 
 
 class AdaptiveEngine:
@@ -23,14 +30,31 @@ class AdaptiveEngine:
     كل إطار (سقف ~10 FPS بغض النظر عن سرعة النموذج فعلياً) - وهذا يناقض جوهر
     الهدف من المشروع (الأداء اللحظي على أجهزة الحافة). الحل: تشغيل المراقبة
     في Thread منفصل كما هو موصوف في الكود الوهمي بالتقرير (صفحة 26).
+
+    Hysteresis + حد أدنى للبقاء (min dwell time): الإصدار السابق كان يستخدم
+    نفس العتبة للدخول والخروج من كل وضع، فإذا استقر الحمل قرب عتبة (مثلاً
+    CPU~40%) كان النظام قد يتذبذب بين وضعين كل دورة مراقبة. الآن: عتبة دخول
+    أصعب من عتبة خروج لكل حد (hysteresis band)، بالإضافة لحد أدنى زمني
+    (min_dwell_seconds) يمنع أي تبديل جديد قبل انقضائه - حتى لو كانت القراءة
+    تبرر تبديلاً فورياً.
     """
 
-    def __init__(self, interval=2.0, cpu_threshold_high=80, cpu_threshold_low=40):
+    def __init__(self, interval=2.0,
+                 cpu_turbo_enter=40, cpu_turbo_exit=55,
+                 cpu_economy_enter=80, cpu_economy_exit=65,
+                 min_dwell_seconds=5.0,
+                 event_log_path=None):
         self.interval = interval
-        self.cpu_threshold_high = cpu_threshold_high
-        self.cpu_threshold_low = cpu_threshold_low
+        self.cpu_turbo_enter = cpu_turbo_enter
+        self.cpu_turbo_exit = cpu_turbo_exit
+        self.cpu_economy_enter = cpu_economy_enter
+        self.cpu_economy_exit = cpu_economy_exit
+        self.min_dwell_seconds = min_dwell_seconds
+        self.event_log_path = event_log_path
 
         self._lock = threading.Lock()
+        self._current_mode = "NORMAL"
+        self._mode_since = time.time()
         self._status = {
             "mode": "NORMAL",
             "resolution": MODE_SETTINGS["NORMAL"]["resolution"],
@@ -39,7 +63,13 @@ class AdaptiveEngine:
             "ram_usage": 0.0,
             "battery": None,
             "temperature": None,
+            "reason": "initial",
+            "time_in_mode": 0.0,
         }
+
+        if self.event_log_path and not os.path.exists(self.event_log_path):
+            with open(self.event_log_path, "w", newline="") as f:
+                csv.writer(f).writerow(EVENT_LOG_HEADER)
 
         self._stop_event = threading.Event()
         self._thread = threading.Thread(target=self._loop, daemon=True)
@@ -64,17 +94,43 @@ class AdaptiveEngine:
             return None  # غير مدعوم على كل الأنظمة (مثل Windows/macOS أحياناً)
 
     def _decide(self, cpu, ram, battery, temperature):
-        """قاعدة القرار الديناميكية (شكل 3-4 في التقرير)."""
+        """قاعدة القرار الديناميكية (شكل 3-4 في التقرير) مع hysteresis: العتبة
+        المستخدمة لكل حد تعتمد على الوضع الحالي (self._current_mode) - أصعب
+        للدخول، أسهل نسبياً للبقاء. يعيد (الوضع المقترَح, السبب)."""
         if battery is not None and battery <= 20:
-            return "ECONOMY"
+            return "ECONOMY", f"بطارية منخفضة ({battery:.0f}%<=20%)"
         if temperature is not None and temperature >= 80:
-            return "ECONOMY"
+            return "ECONOMY", f"حرارة مرتفعة ({temperature:.0f}°C>=80°C)"
 
-        if cpu < self.cpu_threshold_low and ram < 60 and (temperature is None or temperature < 70):
-            return "TURBO"
-        if cpu < self.cpu_threshold_high and ram < 80 and (temperature is None or temperature < 80):
-            return "NORMAL"
-        return "ECONOMY"
+        was = self._current_mode
+        ram_ok_turbo = ram < 60 and (temperature is None or temperature < 70)
+        ram_ok_normal = ram < 80 and (temperature is None or temperature < 80)
+
+        turbo_threshold = self.cpu_turbo_exit if was == "TURBO" else self.cpu_turbo_enter
+        if cpu < turbo_threshold and ram_ok_turbo:
+            band = "خروج" if was == "TURBO" else "دخول"
+            return "TURBO", f"CPU={cpu:.0f}%<{turbo_threshold:.0f}% (عتبة {band})"
+
+        economy_threshold = self.cpu_economy_exit if was == "ECONOMY" else self.cpu_economy_enter
+        if cpu >= economy_threshold or not ram_ok_normal:
+            band = "خروج" if was == "ECONOMY" else "دخول"
+            reason = f"CPU={cpu:.0f}%>={economy_threshold:.0f}% (عتبة {band})" if cpu >= economy_threshold \
+                else f"RAM={ram:.0f}% أو حرارة مرتفعة"
+            return "ECONOMY", reason
+
+        return "NORMAL", f"CPU={cpu:.0f}% ضمن نطاق NORMAL"
+
+    def _log_switch(self, old_mode, new_mode, dwell_seconds, cpu, ram, battery, temperature, reason):
+        if not self.event_log_path:
+            return
+        with open(self.event_log_path, "a", newline="") as f:
+            csv.writer(f).writerow([
+                time.strftime("%Y-%m-%dT%H:%M:%S"), old_mode, new_mode, f"{dwell_seconds:.2f}",
+                f"{cpu:.1f}", f"{ram:.1f}",
+                "" if battery is None else f"{battery:.1f}",
+                "" if temperature is None else f"{temperature:.1f}",
+                reason,
+            ])
 
     def _loop(self):
         while not self._stop_event.is_set():
@@ -84,19 +140,36 @@ class AdaptiveEngine:
             ram_usage = psutil.virtual_memory().percent
             battery = self._read_battery()
             temperature = self._read_temperature()
+            now = time.time()
 
-            mode = self._decide(cpu_usage, ram_usage, battery, temperature)
-            settings = MODE_SETTINGS[mode]
+            proposed_mode, reason = self._decide(cpu_usage, ram_usage, battery, temperature)
+            dwell_so_far = now - self._mode_since
 
+            if proposed_mode != self._current_mode and dwell_so_far < self.min_dwell_seconds:
+                # قرار بالتبديل لكن حد البقاء الأدنى لم ينقضِ بعد - نبقى بالوضع
+                # الحالي هذه الدورة، ونعيد المحاولة بالدورة التالية.
+                proposed_mode = self._current_mode
+                reason = f"مؤجَّل (dwell={dwell_so_far:.1f}s<{self.min_dwell_seconds:.0f}s): {reason}"
+
+            if proposed_mode != self._current_mode:
+                self._log_switch(self._current_mode, proposed_mode, dwell_so_far,
+                                  cpu_usage, ram_usage, battery, temperature, reason)
+                self._current_mode = proposed_mode
+                self._mode_since = now
+                dwell_so_far = 0.0
+
+            settings = MODE_SETTINGS[self._current_mode]
             with self._lock:
                 self._status = {
-                    "mode": mode,
+                    "mode": self._current_mode,
                     "resolution": settings["resolution"],
                     "layers_count": settings["layers_count"],
                     "cpu_usage": cpu_usage,
                     "ram_usage": ram_usage,
                     "battery": battery,
                     "temperature": temperature,
+                    "reason": reason,
+                    "time_in_mode": dwell_so_far,
                 }
 
             # ننام حتى نهاية الفترة المتبقية (interval الكلي بين قرارين، افتراضياً 2 ثانية)
@@ -117,15 +190,26 @@ class AdaptiveEngine:
         self._thread.join(timeout=1.0)
 
 
-# اختبار المحرك بشكل مستقل
+# اختبار المحرك بشكل مستقل - مرّر --log لتفعيل تسجيل CSV لكل تبديل فعلي
+# (اختبار الحِمل الفعلي بـstress-ng على الجهاز يكون بسكربت dic_stress_test.py)
 if __name__ == "__main__":
-    engine = AdaptiveEngine(interval=2.0)
+    import argparse
+
+    parser = argparse.ArgumentParser(description="اختبار مستقل لمحرك DIC")
+    parser.add_argument("--log", default=None, help="مسار ملف CSV لتسجيل أحداث التبديل")
+    parser.add_argument("--seconds", type=int, default=10)
+    args = parser.parse_args()
+
+    engine = AdaptiveEngine(interval=2.0, event_log_path=args.log)
     try:
-        for _ in range(5):
+        for _ in range(max(1, args.seconds)):
             status = engine.get_current_mode()
             print(f"Mode: {status['mode']:8s} | Res: {status['resolution']} | "
                   f"CPU: {status['cpu_usage']:.1f}% | RAM: {status['ram_usage']:.1f}% | "
-                  f"Battery: {status['battery']} | Temp: {status['temperature']}")
+                  f"Battery: {status['battery']} | Temp: {status['temperature']} | "
+                  f"since {status['time_in_mode']:.1f}s | {status['reason']}")
             time.sleep(1.0)
     finally:
         engine.stop()
+        if args.log:
+            print(f"\nسجل أحداث التبديل: {args.log}")

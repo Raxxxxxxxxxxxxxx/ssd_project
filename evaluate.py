@@ -33,32 +33,104 @@ def compute_ap(recalls, precisions):
     return ap
 
 
-def evaluate(dataset, detect_fn, iou_thresh=0.5):
+# شرائح حجم الجسم بأسلوب COCO (مساحة بالبكسل² في الصورة الأصلية): صغير <32²،
+# متوسط 32²-96²، كبير >96². تُستخدم لإثبات كمّياً أن ECONOMY (يعطّل C1) يضحّي
+# بالأجسام الصغيرة تحديداً، بدل الاكتفاء بالادعاء النوعي فقط.
+SIZE_BUCKETS = {
+    "small": (0, 32 ** 2),
+    "medium": (32 ** 2, 96 ** 2),
+    "large": (96 ** 2, float("inf")),
+}
+
+
+def _compute_class_ap(preds, gt_entry_lists, n_gt, iou_thresh, size_range=None):
+    """preds: قائمة (score, image_idx, box) مرتّبة تنازلياً. gt_entry_lists:
+    {image_idx: {"boxes":[[xmin,ymin,xmax,ymax] بكسل,...], "difficult":[bool,...], "areas":[float,...]}}.
+    صندوق حقيقة difficult، أو خارج size_range إن حُدِّد، يُتجاهل تماماً (لا TP ولا FP)
+    حسب بروتوكول VOC القياسي - وليس FP كما لو أنه غير موجود إطلاقاً."""
+    if n_gt == 0:
+        return None
+
+    tp = torch.zeros(len(preds))
+    fp = torch.zeros(len(preds))
+    ignore = torch.zeros(len(preds), dtype=torch.bool)
+    matched = {k: [False] * len(v["boxes"]) for k, v in gt_entry_lists.items()}
+
+    for i, (score, image_idx, box) in enumerate(preds):
+        entry = gt_entry_lists.get(image_idx)
+        if entry is None or len(entry["boxes"]) == 0:
+            fp[i] = 1
+            continue
+
+        pred_box = torch.tensor([box], dtype=torch.float32)
+        gt_boxes_t = torch.tensor(entry["boxes"], dtype=torch.float32)
+        ious = box_iou(pred_box, gt_boxes_t)[0]
+        best_iou, best_idx = ious.max(dim=0)
+        best_idx = best_idx.item()
+
+        if best_iou >= iou_thresh:
+            out_of_bucket = size_range is not None and not (
+                size_range[0] <= entry["areas"][best_idx] < size_range[1]
+            )
+            if entry["difficult"][best_idx] or out_of_bucket:
+                ignore[i] = True
+            elif not matched[image_idx][best_idx]:
+                tp[i] = 1
+                matched[image_idx][best_idx] = True
+            else:
+                fp[i] = 1
+        else:
+            fp[i] = 1
+
+    keep = ~ignore
+    tp_cum = torch.cumsum(tp[keep], dim=0)
+    fp_cum = torch.cumsum(fp[keep], dim=0)
+    recalls = tp_cum / n_gt
+    precisions = tp_cum / (tp_cum + fp_cum).clamp(min=1e-9)
+    return compute_ap(recalls.tolist(), precisions.tolist())
+
+
+def evaluate(dataset, detect_fn, iou_thresh=0.5, by_size=False):
     """
     يحسب mAP@0.5 بغضّ النظر عن مصدر الاكتشافات - detect_fn(frame) -> قائمة
     (box, class_id, score) هي الواجهة الوحيدة المطلوبة. هذا يسمح بإعادة
     استخدام نفس منطق حساب AP لأي backend (PyTorch أو TFLite) دون تكرار.
+
+    الأجسام المعلَّمة difficult في VOC تُستثنى من حساب mAP (بروتوكول VOC
+    القياسي) دون التأثير على أي شيء آخر. إن كان by_size=True، تُحسب أيضاً AP
+    لكل شريحة حجم (SIZE_BUCKETS) بإعادة استخدام نفس الاكتشافات المُجمَّعة أصلاً
+    - بلا أي استدلال إضافي على النموذج.
     """
     # لكل صنف: قائمة (confidence, is_true_positive) ولكل صورة: صناديق الحقيقة المتبقية غير المطابَقة
     all_predictions = defaultdict(list)
-    all_gts_by_class = defaultdict(dict)  # class_id -> {image_idx: {"boxes":..., "matched":[bool,...]}}
+    all_gts_by_class = defaultdict(dict)  # class_id -> {image_idx: {"boxes":..., "difficult":..., "areas":...}}
     num_gt_per_class = defaultdict(int)
+    num_gt_per_class_by_size = {name: defaultdict(int) for name in SIZE_BUCKETS}
 
     for idx in range(len(dataset)):
-        frame, gt_boxes, gt_labels = dataset[idx]
+        frame, gt_boxes, gt_labels, gt_difficult = dataset[idx]
         h, w = frame.shape[:2]
 
-        for box, label in zip(gt_boxes.tolist(), gt_labels.tolist()):
+        for box, label, difficult in zip(gt_boxes.tolist(), gt_labels.tolist(), gt_difficult.tolist()):
             class_id = label + 1  # +1 لأن 0 محجوزة للخلفية في مخرجات النموذج
             # تحويل صندوق الحقيقة من الإحداثيات المُطبَّعة [0,1] إلى بكسل، لأن
             # postprocess() يُخرج صناديق التوقع بالبكسل مباشرة - أي مقارنة IoU
             # بين نظامي إحداثيات مختلفين تُعطي صفراً دائماً بغض النظر عن جودة النموذج.
             xmin, ymin, xmax, ymax = box
             pixel_box = [xmin * w, ymin * h, xmax * w, ymax * h]
-            entry = all_gts_by_class[class_id].setdefault(idx, {"boxes": [], "matched": []})
+            area = (pixel_box[2] - pixel_box[0]) * (pixel_box[3] - pixel_box[1])
+            is_difficult = bool(difficult)
+
+            entry = all_gts_by_class[class_id].setdefault(idx, {"boxes": [], "difficult": [], "areas": []})
             entry["boxes"].append(pixel_box)
-            entry["matched"].append(False)
-            num_gt_per_class[class_id] += 1
+            entry["difficult"].append(is_difficult)
+            entry["areas"].append(area)
+
+            if not is_difficult:
+                num_gt_per_class[class_id] += 1
+                for size_name, size_range in SIZE_BUCKETS.items():
+                    if size_range[0] <= area < size_range[1]:
+                        num_gt_per_class_by_size[size_name][class_id] += 1
 
         detections = detect_fn(frame)
 
@@ -69,39 +141,24 @@ def evaluate(dataset, detect_fn, iou_thresh=0.5):
             print(f"  ... تمت معالجة {idx + 1}/{len(dataset)} صورة")
 
     aps = {}
+    aps_by_size = {name: {} for name in SIZE_BUCKETS}
     for class_id in range(1, len(VOC_CLASSES)):
         preds = sorted(all_predictions[class_id], key=lambda p: p[0], reverse=True)
-        n_gt = num_gt_per_class[class_id]
-        if n_gt == 0:
-            continue
+        gt_entry_lists = all_gts_by_class[class_id]
 
-        tp = torch.zeros(len(preds))
-        fp = torch.zeros(len(preds))
+        ap = _compute_class_ap(preds, gt_entry_lists, num_gt_per_class[class_id], iou_thresh)
+        if ap is not None:
+            aps[class_id] = ap
 
-        for i, (score, image_idx, box) in enumerate(preds):
-            gt_entry = all_gts_by_class[class_id].get(image_idx)
-            if gt_entry is None or len(gt_entry["boxes"]) == 0:
-                fp[i] = 1
-                continue
+        if by_size:
+            for size_name, size_range in SIZE_BUCKETS.items():
+                n_gt_size = num_gt_per_class_by_size[size_name][class_id]
+                ap_size = _compute_class_ap(preds, gt_entry_lists, n_gt_size, iou_thresh, size_range)
+                if ap_size is not None:
+                    aps_by_size[size_name][class_id] = ap_size
 
-            pred_box = torch.tensor([box], dtype=torch.float32)
-            gt_boxes_t = torch.tensor(gt_entry["boxes"], dtype=torch.float32)
-            ious = box_iou(pred_box, gt_boxes_t)[0]
-            best_iou, best_idx = ious.max(dim=0)
-
-            if best_iou >= iou_thresh and not gt_entry["matched"][best_idx]:
-                tp[i] = 1
-                gt_entry["matched"][best_idx] = True
-            else:
-                fp[i] = 1
-
-        tp_cum = torch.cumsum(tp, dim=0)
-        fp_cum = torch.cumsum(fp, dim=0)
-        recalls = tp_cum / n_gt
-        precisions = tp_cum / (tp_cum + fp_cum).clamp(min=1e-9)
-
-        aps[class_id] = compute_ap(recalls.tolist(), precisions.tolist())
-
+    if by_size:
+        return aps, aps_by_size
     return aps
 
 
@@ -116,6 +173,9 @@ def main():
     parser.add_argument("--tflite-float", action="store_true",
                          help="استخدام float16 بدل INT8 الكامل لـ backend=tflite")
     parser.add_argument("--conf-thresh", type=float, default=0.01)
+    parser.add_argument("--by-size", action="store_true",
+                         help="إضافة تفصيل AP حسب حجم الجسم (small<32², medium 32²-96², large>96²، "
+                              "بأسلوب COCO) - يعيد استخدام نفس الاكتشافات بلا استدلال إضافي")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
@@ -209,8 +269,10 @@ def main():
             return postprocess_numpy(outputs[4], scores, anchors, (w, h),
                                       conf_thresh=args.conf_thresh, nms_thresh=0.45, top_k=200)
 
-    print(f"تقييم على {len(dataset)} صورة ({args.split}) بوضع {args.mode}, backend={args.backend}...")
-    aps = evaluate(dataset, detect_fn)
+    print(f"تقييم على {len(dataset)} صورة ({args.split}) بوضع {args.mode}, backend={args.backend} "
+          f"(استثناء أجسام difficult حسب بروتوكول VOC)...")
+    result = evaluate(dataset, detect_fn, by_size=args.by_size)
+    aps, aps_by_size = result if args.by_size else (result, None)
 
     print("\n--- الدقة لكل صنف (AP) ---")
     for class_id, ap in sorted(aps.items()):
@@ -218,6 +280,17 @@ def main():
 
     mean_ap = sum(aps.values()) / max(len(aps), 1)
     print(f"\nmAP@0.5 = {mean_ap * 100:.2f}%  (المرجع في التقرير: 71.4% على وضع NORMAL)")
+
+    if args.by_size:
+        print("\n--- mAP حسب حجم الجسم (بأسلوب COCO: small<32², medium 32²-96², large>96²) ---")
+        size_labels = {"small": "صغير  (<32²)", "medium": "متوسط (32²-96²)", "large": "كبير  (>96²)"}
+        for size_name, label in size_labels.items():
+            size_aps = aps_by_size[size_name]
+            if not size_aps:
+                print(f"  {label}: لا توجد أجسام كافية بهذه الشريحة في {args.split}")
+                continue
+            size_mean = sum(size_aps.values()) / len(size_aps)
+            print(f"  {label}: mAP={size_mean * 100:.2f}%  (عدد الأصناف المُقاسة: {len(size_aps)})")
 
 
 if __name__ == "__main__":

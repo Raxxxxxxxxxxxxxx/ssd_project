@@ -15,6 +15,7 @@
 """
 
 import argparse
+import statistics
 import time
 
 from utils import VOC_CLASSES
@@ -86,6 +87,9 @@ def main():
     parser.add_argument("--mode", default="all", choices=["ECONOMY", "NORMAL", "TURBO", "all"])
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--iters", type=int, default=30)
+    parser.add_argument("--repeats", type=int, default=3,
+                         help="عدد مرات تكرار كل قياس (نفس مصطلح المرحلة 7-ج) - "
+                              "'105.7 ± 2.1' أقوى بكثير من رقم واحد بلا تكرار")
     args = parser.parse_args()
 
     if args.backend == "pytorch":
@@ -98,13 +102,20 @@ def main():
 
     modes = ["ECONOMY", "NORMAL", "TURBO"] if args.mode == "all" else [args.mode]
 
-    print(f"\n{'الوضع':<10} {'الدقة':<12} {'زمن الاستجابة':<15} {'FPS':<8}")
-    print("-" * 50)
+    print(f"\n{'الوضع':<10} {'الدقة':<12} {'زمن الاستجابة':<18} {'FPS':<14} {'التكرارات':<10}")
+    print("-" * 68)
     for mode in modes:
         resolution = MODE_CONFIG[mode]["resolution"]
-        latency = run(mode, resolution, warmup=5, iters=args.iters)
+        latencies = [run(mode, resolution, warmup=5, iters=args.iters) for _ in range(args.repeats)]
+        fps_values = [1.0 / lat for lat in latencies]
+
+        mean_latency_ms = statistics.mean(latencies) * 1000
+        mean_fps = statistics.mean(fps_values)
+        std_fps = statistics.stdev(fps_values) if len(fps_values) > 1 else 0.0
+
         res = resolution
-        print(f"{mode:<10} {f'{res[0]}x{res[1]}':<12} {latency*1000:>10.1f} ms   {1.0/latency:>6.1f}")
+        print(f"{mode:<10} {f'{res[0]}x{res[1]}':<12} {mean_latency_ms:>10.1f} ms      "
+              f"{mean_fps:>6.1f} ± {std_fps:<4.1f}  ({args.repeats}x)")
 
     print("\n(للمقارنة المرجعية بالتقرير: SSD-VGG16 الأصلي <3 FPS على RPi4، ~10 FPS على Jetson Nano)")
 

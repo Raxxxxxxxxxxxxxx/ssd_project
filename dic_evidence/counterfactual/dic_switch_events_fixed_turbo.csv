@@ -1,0 +1,2 @@
+timestamp,old_mode,new_mode,dwell_seconds,cpu_usage,ram_usage,battery,temperature,reason
+2026-08-03T09:28:05,NORMAL,TURBO,5.14,31.8,76.7,,29.2,مثبَّت يدوياً لاختبار المقارنة المضادة (TURBO)

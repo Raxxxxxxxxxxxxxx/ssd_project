@@ -40,10 +40,22 @@ def main():
     parser.add_argument("--camera", type=int, default=0)
     parser.add_argument("--duration", type=int, default=180, help="مدة الاختبار بالثواني")
     parser.add_argument("--sample-interval", type=float, default=1.0)
-    parser.add_argument("--event-log", default="dic_switch_events.csv",
+    parser.add_argument("--event-log", default=None,
                          help="سجل تبديلات DIC الفعلية (من AdaptiveEngine مباشرة)")
-    parser.add_argument("--log", default="dic_stress_log.csv", help="سجل العينات الدورية (CPU/mode/FPS)")
+    parser.add_argument("--log", default=None, help="سجل العينات الدورية (CPU/mode/FPS)")
+    parser.add_argument("--fixed-mode", default=None, choices=["ECONOMY", "NORMAL", "TURBO"],
+                         help="مقارنة مضادة (counterfactual): يعطّل قرار DIC ويثبّت الوضع "
+                              "طوال الاختبار، مع إبقاء مراقبة CPU/RAM الحقيقية شغّالة لنفس "
+                              "التسجيل. شغّل نفس نمط stress-ng مرتين: بلا هذا الخيار (DIC "
+                              "مفعَّل)، ثم معه (--fixed-mode TURBO مثلاً) لمقارنة FPS تحت "
+                              "نفس الحمل بالضبط.")
     args = parser.parse_args()
+
+    suffix = f"_fixed_{args.fixed_mode.lower()}" if args.fixed_mode else ""
+    if args.log is None:
+        args.log = f"dic_stress_log{suffix}.csv"
+    if args.event_log is None:
+        args.event_log = f"dic_switch_events{suffix}.csv"
 
     if args.backend == "onnx":
         from onnx_inference import ONNXAdaptiveInference
@@ -51,6 +63,13 @@ def main():
     else:
         from inference import AdaptiveInference
         inf = AdaptiveInference(checkpoint=args.checkpoint)
+
+    if args.fixed_mode:
+        fixed = args.fixed_mode
+        reason = f"مثبَّت يدوياً لاختبار المقارنة المضادة ({fixed})"
+        inf.engine._decide = lambda cpu, ram, battery, temperature: (fixed, reason)
+        print(f"[مقارنة مضادة] DIC معطَّل قرارياً — الوضع مثبَّت على {fixed} طوال الاختبار "
+              f"(مراقبة CPU/RAM الحقيقية تبقى شغّالة لنفس التسجيل).\n")
 
     from adaptive_engine import EVENT_LOG_HEADER
     with open(args.event_log, "w", newline="") as f:

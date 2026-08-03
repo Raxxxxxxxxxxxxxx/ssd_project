@@ -1,0 +1,5 @@
+timestamp,old_mode,new_mode,dwell_seconds,cpu_usage,ram_usage,battery,temperature,reason
+2026-08-03T08:19:09,NORMAL,ECONOMY,7.02,99.0,71.9,,37.0,CPU=99%>=80% (عتبة دخول)
+2026-08-03T08:19:15,ECONOMY,NORMAL,6.03,19.1,71.7,,35.2,CPU=19% ضمن نطاق NORMAL
+2026-08-03T08:19:30,NORMAL,ECONOMY,14.60,100.0,71.9,,37.5,CPU=100%>=80% (عتبة دخول)
+2026-08-03T08:20:29,ECONOMY,NORMAL,58.94,25.0,71.7,,38.5,CPU=25% ضمن نطاق NORMAL
